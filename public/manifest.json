@@ -1,0 +1,22 @@
+{
+  "id": "/",
+  "name": "سند - التنسيق العائلي لرعاية شخص بالغ",
+  "short_name": "سند",
+  "description": "تطبيق التنسيق العائلي لرعاية شخص بالغ مع حوكمة صارمة للبيانات الصحية والأدوار",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#4F46E5",
+  "background_color": "#F8FAFC",
+  "orientation": "portrait",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

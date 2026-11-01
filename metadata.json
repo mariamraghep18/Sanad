@@ -1,0 +1,6 @@
+{
+  "name": "سند | Sanad",
+  "description": "تطبيق ويب وPWA عربي للتنسيق العائلي لرعاية شخص بالغ مع حوكمة صارمة للبيانات الصحية والأدوار",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

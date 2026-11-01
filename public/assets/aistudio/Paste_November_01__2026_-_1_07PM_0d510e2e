@@ -1,0 +1,623 @@
+# سند / Sanad — مواصفة Backend وقاعدة البيانات وواجهات API
+
+**المؤلف الافتراضي:** Manus AI — **التاريخ:** 1 نوفمبر 2026.
+
+**الحالة:** تصميم نهائي قابل للتنفيذ، وليس خدمة منشورة.  
+**النطاق:** تطبيق ويب/PWA عربي RTL للتنسيق العائلي لرعاية شخص بالغ. سند ليس طبيبًا ولا مستشارًا طبيًا، ولا يثبت السلطة القانونية أو الوصاية.  
+**اللغة التشغيلية:** واجهة عربية مصرية-friendly، مع أسماء enums وحقول إنجليزية ثابتة في الـAPI وقاعدة البيانات.
+
+## 1. القرارات الكانونية التي لا يجوز كسرها
+
+كل `care_circle` يخدم **مستفيد رعاية واحدًا فقط** في MVP. المستخدم الواحد يمكن أن يكون عضوًا في دوائر كثيرة. ملف المستفيد منفصل عن المستخدم: قد يكون له حساب مرتبط، وقد لا يكون له حساب. وجود شخص في العائلة ليس دليلًا على امتلاكه حق اتخاذ قرار أو رؤية بيانات صحية.
+
+الأدوار ثلاثة: `admin` و`caregiver` و`viewer`. يوجد بجانب الدور علم مستقل اسمه `can_view_health_data`. الـadmin يدير الدائرة، لكنه لا يتجاوز هذا العلم. لذلك لا يكفي أن نقول «هذا Admin» كي نعرض دواء أو تقريرًا أو ملاحظة صحية.
+
+عند إنشاء الدائرة، يختار المنشئ أول Admin صراحة، ويسجل النظام `consent` و`authority_attestation` مع نص النسخة وتاريخها. هذا **إقرار داخل التطبيق** وليس تحققًا قانونيًا. إذا كان المستفيد المرتبط بحساب يطلب إيقاف المعالجة أو يسحبها، أو إذا سُجل أساس ممثل مفوض، فهذه الوقائع تُحفظ بإصدارات وعمليات سحب. تفاصيل الأساس المقبول تختلف حسب الدولة؛ لا يدّعي هذا التصميم أنه تحقق منها.
+
+إزالة العضو إجراء عضوية مستقل. أما recipient withdrawal فيوقف لكل المستفيد كل health access وAI وexports والـjobs والإشعارات المستقبلية، ويزيد `care_circles.authorization_epoch`؛ لا يقتصر على سحب عضوية مستخدم واحد. لا يمكن استدعاء نسخة تم تنزيلها بالفعل من جهازه، لذلك يعرض التطبيق هذا التحذير قبل التصدير والتنزيل.
+
+النصوص العربية المهمة في الحالة هي: `unrecorded` = «قبل الموعد: بانتظار المتابعة» إذا لم يحِن الوقت، وبعده «المتابعة غير مؤكدة»؛ `recorded` = «تم تسجيل المتابعة»، ولا يعني أن الشيء أُخذ أو نُفّذ طبيًا؛ `not_done` = «مسجل أنه لم يُنفذ». لا يُستنتج من غياب التسجيل أن جرعة فاتت أو أُخذت. في نموذج التسجيل لا توجد قيمة افتراضية: يختار المستخدم صراحة `result=done|not_done` و`truth_source=first_hand|observed|reported`.
+
+## 2. الاختيار التقني وحدود الوصول
+
+الاقتراح هو Next.js مع TypeScript لطبقة HTTP والـPWA، وSupabase Auth للمصادقة، وPostgres للبيانات، وSupabase Storage للملفات الخاصة. تُعرض واجهة API مخصصة `/api/v1` من خادم Next.js؛ لا يكتب العميل مباشرة إلى الجداول التشغيلية عبر Supabase Data API. يمكن استخدام Data API للقراءة المقيدة فقط إذا كانت RLS وgrants مضبوطة، أما عمليات الانتقال الحساسة فتكون في server-only service أو RPC ضيقة الصلاحيات.
+
+يجب تفعيل RLS على كل جدول أو view مكشوف، مع grants صريحة فقط. `service_role` يتجاوز RLS، ولذلك يبقى server-only. توثيق Supabase يوضح أن السياسة شرط صف إضافي وأن grant واسع قد يترك مسار كتابة غير مقصود [1]. يفضّل وضع السطح المنشور في schema اسمها `api` وترك الجداول الداخلية في `private`، مع مراجعة أي view أو `security definer` [2].
+
+تُستخدم UUIDv7 أو UUID عشوائية آمنة للمعرفات، ولا يقبل الخادم `workspace_id` أو `circle_id` القادم من العميل كدليل ملكية. كل معرّف يُفحص بعد المصادقة وبحسب عضوية المستخدم الفعالة في الدائرة. الوقت المخزن دائمًا UTC مع `timestamptz`، بينما كل دائرة تخزن IANA timezone مثل `Africa/Cairo`. التواريخ المحلية تُحوّل إلى UTC عند الحفظ ولا يعاد تفسير الوقائع التاريخية عند تغيير المنطقة الزمنية.
+
+## 3. نموذج البيانات typed schema
+
+المقاطع التالية PostgreSQL-oriented schema وليست migration كاملة. كل جدول يحتوي `id uuid primary key` ما لم يُذكر غير ذلك، وكل `created_at` و`updated_at` من نوع `timestamptz not null default now()`. الحقول `text` لها حد طول في طبقة API وقيد قاعدة البيانات حين يكون ذلك مهمًا.
+
+### الهوية والدائرة
+
+```text
+profiles
+- id uuid PK references auth.users(id) on delete cascade
+- display_name text not null check (char_length(display_name) between 1 and 120)
+- phone_e164 text null check (phone_e164 ~ '^\\+[1-9][0-9]{7,14}$')
+- locale text not null default 'ar-EG'
+- timezone text not null default 'Africa/Cairo'
+- status text not null default 'active' check (status in ('active','disabled','deleted'))
+- created_at, updated_at timestamptz not null
+```
+
+```text
+care_circles
+- id uuid PK
+- name text not null check (char_length(name) between 1 and 120)
+- timezone text not null check (timezone is a valid IANA zone)
+- status text not null default 'active' check (status in ('active','paused','closed'))
+- health_processing_enabled boolean not null default true
+- authorization_epoch bigint not null default 1 check (authorization_epoch > 0)
+- consent_version text not null
+- created_by uuid not null references profiles(id)
+- created_at, updated_at timestamptz not null
+- unique (id, timezone)
+
+care_recipients
+- id uuid PK
+- linked_user_id uuid null references profiles(id) on delete set null
+- preferred_name text not null check (char_length(preferred_name) between 1 and 120)
+- legal_name text null check (char_length(legal_name) <= 200)
+- birth_year smallint null check (birth_year between 1900 and extract(year from now())::int)
+- status text not null default 'active' check (status in ('active','archived','deleted'))
+- created_at, updated_at timestamptz not null
+
+circle_recipient
+- circle_id uuid PK references care_circles(id) on delete cascade
+- recipient_id uuid not null references care_recipients(id) on delete restrict
+- created_at timestamptz not null
+- unique (recipient_id) -- MVP: a recipient belongs to one active circle
+- unique (circle_id, recipient_id) -- مطلوب للـcomposite FKs
+```
+
+`circle_recipient` هو حل صريح لعلاقة المستفيد بالدائرة، ويجعل same-circle FKs ممكنة. إذا احتاج المنتج لاحقًا دائرة ثانية لنفس الشخص، تزال `unique(recipient_id)` بعد مراجعة الصلاحيات، لا تُترك العلاقة غامضة.
+
+```text
+recipient_authorizations
+- id uuid PK
+- recipient_id uuid not null references care_recipients(id)
+- circle_id uuid not null references care_circles(id)
+- kind text not null check (kind in ('recipient_consent','authorized_representative_attestation','processing_withdrawal','admin_authority_attestation'))
+- status text not null check (status in ('active','revoked','expired'))
+- version integer not null check (version > 0)
+- attested_by_user_id uuid not null references profiles(id)
+- authority_basis text null check (char_length(authority_basis) <= 2000)
+- evidence_storage_key text null -- لا رابط عام؛ اختياري ومشفّر/خاص
+- attestation_text text not null
+- effective_at timestamptz not null
+- revoked_at timestamptz null
+- created_at timestamptz not null
+- unique (recipient_id, circle_id, kind, version)
+- FK (circle_id, recipient_id) references circle_recipient(circle_id, recipient_id)
+```
+
+```text
+circle_members
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- user_id uuid not null references profiles(id) on delete cascade
+- role text not null check (role in ('admin','caregiver','viewer'))
+- can_view_health_data boolean not null default false
+- can_export boolean not null default false -- explicit grant; never implied by role
+- status text not null default 'active' check (status in ('invited','active','removed','revoked'))
+- joined_at timestamptz null
+- removed_at timestamptz null
+- consent_version text not null
+- created_by uuid not null references profiles(id)
+- created_at, updated_at timestamptz not null
+- unique (circle_id, user_id)
+- check (removed_at is null or status in ('removed','revoked'))
+```
+
+لا يوجد trigger يسمح للعضو برفع نفسه إلى Admin أو تفعيل `can_view_health_data`. يمر ذلك عبر endpoint خادمي يتحقق من Admin حالي ومن وجود authority/consent مناسب، ويسجل audit event. إزالة آخر Admin ممنوعة إلا عبر إغلاق الدائرة أو تحويل صريح مسجل.
+
+```text
+invitations
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- email_normalized text not null
+- token_hash bytea not null unique -- HMAC/SHA-256، لا نخزن token الخام
+- role text not null check (role in ('admin','caregiver','viewer'))
+- can_view_health_data boolean not null default false
+- expires_at timestamptz not null
+- accepted_at timestamptz null
+- revoked_at timestamptz null
+- invited_by uuid not null references profiles(id)
+- created_at timestamptz not null
+- check (expires_at <= created_at + interval '7 days')
+```
+
+الفهرس الجزئي المطلوب هو `(circle_id, expires_at) WHERE accepted_at IS NULL AND revoked_at IS NULL`، مع cleanup دوري للمنتهي؛ لا يوجد status مخزن كي يصبح stale. الـtoken أحادي الاستخدام، قصير العمر، مرتبط بالبريد بعد normalization، ولا يفيد مع بريد مختلف. رسالة الدعوة لا تكشف اسم المستفيد في lock screen أو البريد إن لم يكن ذلك ضروريًا.
+
+### المهام والوقائع
+
+المهمة لها قالب قابل للتكرار، لكن كل occurrence مجدول immutable snapshot حتى لا يعيد تعديل القالب كتابة الماضي.
+
+```text
+task_templates
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- title text not null check (char_length(title) between 1 and 160)
+- category text not null check (category in ('general','medication_followup','appointment_logistics'))
+- visibility text not null default 'health' check (visibility in ('general','health'))
+- timezone text not null
+- recurrence_rule text null -- MVP: daily or selected weekdays at fixed local times only
+- active boolean not null default true
+- created_by uuid not null references profiles(id)
+- created_at, updated_at timestamptz not null
+- unique (circle_id, id)
+
+task_template_versions
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- template_id uuid not null
+- version integer not null
+- title text not null
+- category text not null check (category in ('general','medication_followup','appointment_logistics'))
+- visibility text not null default 'health' check (visibility in ('general','health'))
+- timezone text not null
+- recurrence_rule text null -- MVP: daily or selected weekdays at fixed local times only
+- recurrence_start_local timestamp without time zone not null
+- recurrence_end_local timestamp without time zone null
+- ongoing_confirmed boolean not null default false
+- effective_from timestamptz not null
+- created_by uuid not null references profiles(id)
+- created_at, updated_at timestamptz not null
+- unique (circle_id, id)
+- unique (circle_id, template_id, version)
+- FK (circle_id, template_id) references task_templates(circle_id, id) on delete restrict
+- check (recurrence_end_local is not null or ongoing_confirmed = true)
+
+task_occurrences
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- template_id uuid not null
+- template_version_id uuid not null
+- title_snapshot text not null
+- category text not null check (category in ('general','medication_followup','appointment_logistics'))
+- visibility text not null default 'health' check (visibility in ('general','health'))
+- timezone_snapshot text not null
+- scheduled_at timestamptz not null
+- due_window_end timestamptz null
+- status text not null default 'unrecorded' check (status in ('unrecorded','recorded','not_done','cancelled'))
+- row_version integer not null default 1 check (row_version > 0)
+- cancelled_at timestamptz null
+- created_by uuid not null references profiles(id)
+- created_at, updated_at timestamptz not null
+- unique (template_id, scheduled_at)
+- unique (circle_id, id) -- مطلوب للـsame-circle FKs
+- FK (circle_id, template_id) references task_templates(circle_id, id)
+- FK (circle_id, template_version_id) references task_template_versions(circle_id, id)
+``` 
+
+`due` و`late` إسقاطان محسوبان من `scheduled_at`, `due_window_end`, ووقت الطلب؛ لا نخزنهما كحالة مستقلة. لا يُسمح بتغيير `scheduled_at` أو `timezone_snapshot` بعد الإنشاء. في MVP لا يقبل الخادم إلا RRULE يومية أو أيام أسبوع مختارة بأوقات محلية ثابتة. إذا وقع الوقت المحلي في DST ambiguous/nonexistent، تتوقف الجدولة لمراجعة المستخدم؛ لا يخمّن النظام توقيت دواء. تعديل الجدول ينشئ occurrences مستقبلية جديدة ويلغي غير المنفذ مستقبلًا فقط عبر حدث واضح؛ الماضي يبقى كما هو، وكل occurrence يحتفظ بـ`template_version_id` المختار وsnapshot immutable.
+
+```text
+assignments
+- id uuid PK
+- occurrence_id uuid not null references task_occurrences(id) on delete cascade
+- circle_id uuid not null references care_circles(id) on delete cascade
+- assignee_user_id uuid null references profiles(id)
+- state text not null default 'pending' check (state in ('pending','accepted','declined','reassigned','cancelled'))
+- assigned_by uuid not null references profiles(id)
+- responded_at timestamptz null
+- row_version integer not null default 1 check (row_version > 0)
+- created_at, updated_at timestamptz not null
+- FK (circle_id, occurrence_id) references task_occurrences(circle_id, id)
+```
+
+يوجد partial unique index على `assignments(occurrence_id) where state='accepted'` لمنع شخصين من امتلاك نفس occurrence، ولا يوجد unique على `(occurrence_id, assignee_user_id)` حتى يمكن للشخص نفسه العودة لاحقًا بعد handoff. «غير معيّن» يُعرض إذا لم يوجد accepted assignment، حتى لو وُجد pending؛ أما الطلب المعلّق فيظهر «في انتظار موافقة المسؤول» ولا يُعرض كمهمة معيّنة بعد. في handoff يبقى accepted الحالي فعالًا حتى يقبل الهدف الجديد؛ ثم تستبدل المعاملة accepted assignmentين atomically، ولا توجد لحظة بلا مسؤول مقبول. قبول/رفض assignment يتم بشرط `expected_row_version` و`row_version` داخل transaction؛ race ثانية تحصل على `409` ولا تغيّر الحالة خلسة.
+
+```text
+care_records
+- id uuid PK
+- occurrence_id uuid not null references task_occurrences(id) on delete restrict
+- circle_id uuid not null references care_circles(id) on delete restrict
+- result text not null check (result in ('done','not_done'))
+- truth_source text not null check (truth_source in ('first_hand','observed','reported'))
+- actor_user_id uuid not null references profiles(id)
+- reported_by_user_id uuid null references profiles(id)
+- reported_by_label text null check (char_length(reported_by_label) <= 200)
+- observed_at timestamptz null
+- observed_time_unknown boolean not null default false
+- recorded_at timestamptz not null default now()
+- note text null check (char_length(note) <= 4000)
+- row_version integer not null default 1
+- record_kind text not null default 'initial' check (record_kind in ('initial','correction'))
+- supersedes_record_id uuid null
+- correction_reason text null
+- created_at timestamptz not null
+- check ((observed_at is null) = observed_time_unknown)
+- check (observed_at is null or observed_at <= recorded_at)
+- unique (circle_id, occurrence_id, id)
+- unique (supersedes_record_id)
+- partial unique index on (occurrence_id) where (record_kind = 'initial')
+- FK (circle_id, occurrence_id) references task_occurrences(circle_id, id)
+- FK (circle_id, occurrence_id, supersedes_record_id) references care_records(circle_id, occurrence_id, id)
+
+care_record_projections
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- occurrence_id uuid not null
+- current_record_id uuid not null
+- row_version integer not null default 1
+- updated_at timestamptz not null
+- unique (circle_id, occurrence_id)
+- FK (circle_id, occurrence_id) references task_occurrences(circle_id, id)
+- FK (circle_id, occurrence_id, current_record_id) references care_records(circle_id, occurrence_id, id)
+```
+
+سجل الإتمام append-only. التصحيح لا يعدّل السجل القديم؛ ينشئ سجلًا جديدًا من `record_kind=correction` يشير إلى `supersedes_record_id`. unique على الأب يمنع fork، وunique initial يمنع أكثر من سجل أولي لكل occurrence. تحديث `care_record_projections` يتم داخل transaction مع guard على `row_version` وcurrent pointer؛ وإلا يرجع `409 stale_version`. `first_hand` يعني «أنا اللي نفذت»، و`observed` يعني «شاهدتها بنفسي»، و`reported` يعني «أُبلغت بها». `observed_at` لا يكون null إلا مع `observed_time_unknown=true` الذي يختاره المستخدم صراحة؛ لا توجد قيمة افتراضية «غير معروف». `reported_by_user_id` أو `reported_by_label` يصف مصدر البلاغ ولا يُستنتج من actor.
+
+```text
+appointments
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- recipient_id uuid not null references care_recipients(id)
+- title text not null check (char_length(title) between 1 and 200)
+- visibility text not null default 'health' check (visibility in ('general','health'))
+- starts_at timestamptz not null
+- ends_at timestamptz null
+- timezone_snapshot text not null
+- location text null check (char_length(location) <= 500)
+- status text not null default 'planned' check (status in ('planned','confirmed','cancelled','completed'))
+- row_version integer not null default 1 check (row_version > 0)
+- created_by uuid not null references profiles(id)
+- created_at, updated_at timestamptz not null
+- unique (circle_id, id)
+- FK (circle_id, recipient_id) references circle_recipient(circle_id, recipient_id)
+```
+
+موعد النقل أو المتابعة ليس حقلًا غامضًا داخل appointment: `task_occurrences` مستقلة وتربط بالموعد عبر `appointment_id` أو جدول ربط، مع FK same-circle. نتائج الموعد لا تُفسر طبيًا؛ هي مرفقات أو نص يدخله المستخدم.
+
+```text
+medication_instructions
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- template_id uuid null
+- occurrence_id uuid null
+- instruction_text text not null check (char_length(instruction_text) between 1 and 4000)
+- entered_by uuid not null references profiles(id)
+- source_label text null check (char_length(source_label) <= 200)
+- source_document_id uuid null
+- confirmed_by uuid null references profiles(id)
+- confirmed_at timestamptz null
+- valid_from timestamptz null
+- valid_until timestamptz null
+- status text not null default 'draft' check (status in ('draft','confirmed','retired'))
+- created_at, updated_at timestamptz not null
+- FK (circle_id, template_id) references task_templates(circle_id, id)
+- FK (circle_id, occurrence_id) references task_occurrences(circle_id, id)
+- FK (circle_id, source_document_id) references documents(circle_id, id)
+```
+
+هذا مرجع بشري فقط، و`source_document_id` و`template_id` و`occurrence_id` كلها same-circle FKs فعلية وليست metadata. لا ينشئ النظام جرعة أو regimen من نموذج أو OCR، ولا يقدم dose guidance أو clinical alert. لا توجد قاعدة «لم يسجل إذن فاتت الجرعة».
+
+### الملفات والملاحظات والذكاء الاصطناعي
+
+```text
+documents
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- recipient_id uuid null references care_recipients(id)
+- storage_key text not null unique -- bucket private، ليس URL عامًا
+- original_name text not null check (char_length(original_name) <= 255)
+- mime_type text not null check (mime_type in ('image/png','image/jpeg','application/pdf'))
+- byte_size bigint not null check (byte_size between 1 and 10000000) -- UI limit 10 MB
+- sha256 bytea not null
+- visibility text not null default 'health' check (visibility in ('general','health'))
+- processing_consent_version text null
+- status text not null default 'upload_pending' check (status in ('upload_pending','active','deleted','quarantined'))
+- uploaded_by uuid not null references profiles(id)
+- deleted_at timestamptz null
+- created_at, updated_at timestamptz not null
+- unique (circle_id, id)
+- FK (circle_id, recipient_id) references circle_recipient(circle_id, recipient_id)
+```
+
+```text
+document_ai_runs
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- document_id uuid not null
+- requested_by uuid not null references profiles(id)
+- input_epoch bigint not null
+- authorization_epoch bigint not null
+- status text not null check (status in ('queued','running','review_required','accepted','rejected','failed','cancelled'))
+- extracted_text text null
+- source_refs jsonb not null default '[]'
+- model_name text null
+- prompt_version text null
+- retry_count integer not null default 0
+- idempotency_key text not null
+- reviewed_by uuid null references profiles(id)
+- reviewed_at timestamptz null
+- cancelled_at timestamptz null
+- last_error text null
+- created_at, updated_at timestamptz not null
+- unique (circle_id, requested_by, idempotency_key)
+- FK (circle_id, document_id) references documents(circle_id, id) on delete restrict
+```
+
+```text
+notes
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- occurrence_id uuid null
+- appointment_id uuid null
+- author_id uuid not null references profiles(id)
+- visibility text not null default 'general' check (visibility in ('general','health'))
+- body text not null check (char_length(body) between 1 and 8000)
+- deleted_at timestamptz null
+- row_version integer not null default 1
+- created_at, updated_at timestamptz not null
+- unique (circle_id, id)
+- FK (circle_id, occurrence_id) references task_occurrences(circle_id, id)
+- FK (circle_id, appointment_id) references appointments(circle_id, id)
+```
+
+أي ملف جديد `health` افتراضيًا. Strict child visibility: note/attachment visibility لا يمكن أن تكون أوسع من parent occurrence أو appointment؛ health parent يمنع general child، ويُفرض ذلك بtrigger/transaction يتحقق من نفس الدائرة.
+
+ الحد الأقصى 10,000,000 byte والـMIME المسموح PNG/JPEG/PDF. `documents.status` يصف upload/retention فقط، ولا يخلط حالة AI؛ و`document_ai_runs` يحمل circle وrequester وinput/authorization epoch وcancel/retry/idempotency. التخزين private، والتنزيل عبر proxy خادمي يتحقق من العضوية والـvisibility في اللحظة نفسها؛ لا نعتمد على signed URL طويل العمر لإلغاء الصلاحية. حذف أو revoke يلغي run ويمنع late writes، ولا ينشر provider/tool أي note أو task أو instruction تلقائيًا. حذف الملف ينشئ tombstone ولا يعاد استخدام `storage_key`.
+
+### الإشعارات والتشغيل والحوكمة
+
+```text
+notification_preferences
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- user_id uuid not null references profiles(id) on delete cascade
+- in_app_enabled boolean not null default true
+- web_push_enabled boolean not null default false
+- task_reminders boolean not null default true
+- followup_notifications boolean not null default false
+- quiet_start_local time null
+- quiet_end_local time null
+- timezone text not null
+- updated_at timestamptz not null
+- unique (circle_id, user_id)
+- FK (circle_id, user_id) references circle_members(circle_id, user_id)
+
+followup_routes
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- source_user_id uuid not null references profiles(id)
+- target_user_id uuid not null references profiles(id)
+- state text not null default 'disabled' check (state in ('disabled','pending','accepted','declined','revoked'))
+- target_opted_in boolean not null default false
+- accepted_at timestamptz null
+- created_at, updated_at timestamptz not null
+- unique (circle_id, source_user_id, target_user_id)
+- FK (circle_id, source_user_id) references circle_members(circle_id, user_id)
+- FK (circle_id, target_user_id) references circle_members(circle_id, user_id)
+```
+
+```text
+notification_outbox
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- recipient_user_id uuid not null references profiles(id)
+- kind text not null check (kind in ('task_reminder','followup','invite','system'))
+- entity_type text not null
+- entity_id uuid not null
+- visibility text not null default 'general' check (visibility in ('general','health'))
+- entity_epoch bigint not null default 1
+- channel text not null check (channel in ('in_app','web_push'))
+- payload jsonb not null -- generic text only، بلا اسم مستفيد أو دواء
+- dedupe_key text not null
+- generation_epoch integer not null default 1
+- state text not null default 'pending' check (state in ('pending','claimed','sent','cancelled','failed'))
+- attempts integer not null default 0
+- max_attempts integer not null default 5
+- available_at timestamptz not null default now()
+- claimed_at timestamptz null
+- lease_expires_at timestamptz null
+- sent_at timestamptz null
+- cancelled_at timestamptz null
+- last_error text null
+- created_at timestamptz not null
+- unique (dedupe_key, channel, generation_epoch)
+- FK (circle_id, recipient_user_id) references circle_members(circle_id, user_id)
+```
+
+```text
+notifications
+- id uuid PK
+- outbox_id uuid not null references notification_outbox(id)
+- user_id uuid not null references profiles(id)
+- circle_id uuid not null references care_circles(id)
+- title text not null
+- body text not null
+- read_at timestamptz null
+- action_at timestamptz null
+- created_at timestamptz not null
+- unique (outbox_id)
+- FK (circle_id, user_id) references circle_members(circle_id, user_id)
+
+notification_delivery_attempts
+- id uuid PK
+- outbox_id uuid not null references notification_outbox(id)
+- channel text not null
+- provider_message_id text null
+- outcome text not null check (outcome in ('accepted','delivered','rejected','expired','unknown'))
+- error_code text null
+- attempted_at timestamptz not null default now()
+- check (outcome <> 'accepted' or channel = 'web_push')
+```
+
+```text
+audit_events
+- id uuid PK
+- circle_id uuid null references care_circles(id) on delete set null
+- actor_user_id uuid null references profiles(id) on delete set null
+- action text not null
+- entity_type text not null
+- entity_id uuid null
+- metadata jsonb not null default '{}' -- لا PII خام ولا نص صحي كامل
+- request_id uuid not null
+- created_at timestamptz not null
+
+export_jobs
+- id uuid PK
+- circle_id uuid not null references care_circles(id) on delete cascade
+- requested_by uuid not null references profiles(id)
+- selection jsonb not null
+- status text not null default 'queued' check (status in ('queued','running','ready','expired','cancelled','failed'))
+- storage_key text null
+- expires_at timestamptz null
+- confirmed_at timestamptz null
+- created_at, updated_at timestamptz not null
+
+idempotency_records
+- user_id uuid not null references profiles(id) on delete cascade
+- idempotency_key text not null
+- route text not null
+- request_hash bytea not null
+- status_code integer null
+- response_ref text null -- pointer/minimal metadata preferred; no raw health response retention
+- response_metadata jsonb null
+- response_json jsonb null -- non-health response only when unavoidable
+- created_at timestamptz not null
+- expires_at timestamptz not null
+- primary key (user_id, route, idempotency_key)
+```
+
+فهرسة التشغيل: `task_occurrences(circle_id, scheduled_at desc)`, و`task_occurrences(circle_id, status, scheduled_at)`, و`care_records(occurrence_id, recorded_at desc)`, و`notes(circle_id, created_at desc)`, و`documents(circle_id, visibility, created_at desc)`, و`notification_outbox(state, available_at)`, و`audit_events(circle_id, created_at desc)`. يضاف partial unique index لقبول assignment كما سبق، وفهرس دعوات على `(email_normalized, expires_at)`.
+
+## 4. محرك المهام والسجل
+
+إنشاء template لا يكتب occurrence غامضًا: ينشئ worker occurrences للفترة المطلوبة مع snapshots، وكل تغيير RRULE/وقت ينشئ `template_version` جديدًا. occurrence تاريخي immutable ولا يُحذف بتعديل القالب.
+
+التعيين يبدأ `pending` ثم `accepted` أو `declined`، مع `reassigned/cancelled` للتاريخ؛ لا يصبح assignee فعليًا بمجرد الإضافة. القبول transaction مع row lock وpartial unique؛ الفائز وحده يحصل على accepted والآخر يرى `409 assignment_already_claimed`.
+
+تسجيل occurrence يتطلب `truth_source` ووقت الواقعة إن عُرف؛ التصحيح immutable ومرتبط بسجل سابق. projection guarded بـ`row_version`، وإلا يرجع `409 stale_version`.
+
+الفئات ليست تشخيصًا؛ medication_followup متابعة بشرية فقط، ولا ينشئ AI regimen أو dose أو alert. البحث والعدادات والقوائم والتصدير والإشعارات تفحص visibility قبل النتيجة، فلا يظهر لعضو بلا health access عدّاد مهمة دواء.
+
+## 5. الإشعارات والجدولة
+
+المسار المختار، كقرار تصميم لا كنظام منشور، هو **Supabase Cron/pg_cron كل دقيقة → authenticated bounded Supabase Edge Function worker → DB outbox → best-effort WebPush**. يستدعي Cron workerًا محدود الزمن والعدد؛ credential للاستدعاء محفوظ في Vault، والـworker وحده يكتب state transitions. AI وexport يستخدمان نفس managed bounded queue/worker architecture، مع timeout limits والتحقق عند التنفيذ من توافق runtime والمكتبات. pg_cron مناسب لتشغيل recurring jobs [3]، لكن إرسال Web Push خارجي لا يُنفذ من SQL مباشرة. لا يوجد مسار scheduler بديل في هذه المواصفة.
+
+كل transition تشغيلي يضيف outbox row في نفس transaction. `dedupe_key` مثل `occurrence:{id}:reminder:{window}` يمنع التكرار، و`generation_epoch` و`entity_epoch` يلغيان رسائل قديمة بعد تعديل الجدول أو سحب الموافقة. الـdispatcher يستخدم claim atomically مع lease expiry/reclaim، وbounded failures عبر `max_attempts` ثم `failed`، مع retry/backoff. قبل الإرسال يقارن epoch authoritative للكيان والدائرة لا snapshot قديم. لا نعد exactly-once مع مزود خارجي: قد يُقبل الطلب ثم تنقطع الشبكة. لهذا يوجد delivery attempt وحالة منفصلة عن read/action؛ قبول provider ليس delivery، وdelivery ليس read.
+
+قبل dispatch يعاد فحص: العضوية active، recipient processing basis الحالية، `health_processing_enabled`، authorization epoch، visibility، notification preference، assignment accepted عند الحاجة، quiet hours والمنطقة الزمنية، وحالة occurrence ما زالت تسمح بالتنبيه. follow-up لا يذهب لعضو آخر إلا عبر `followup_routes` موجود ومساره accepted وtarget opt-in؛ الافتراضي غياب/disabled. إذا أزيل العضو أو سُحبت الموافقة، تتحول الأعمال pending إلى cancelled ويُمنع إنشاء أعمال جديدة. lock-screen text عام مثل «لديك متابعة جديدة في سند»، بلا اسم المستفيد أو اسم الدواء.
+
+in-app inbox يعني الحفظ في قاعدة البيانات لا فتحه. Web Push اختياري وأفضل جهد، مع Push API/service worker وopt-in وحفظ endpoint سرًا [4]. يلزم إذن المستخدم وHTTPS؛ لا نعد بالظهور أو الوصول [5]. ليس Web Push إنذارًا صحيًا، و`read_at`/`action_at` منفصلان عن delivery outcome.
+
+## 6. الملفات وAI والعمل دون اتصال والخصوصية
+
+يرفع الخادم الملف إلى bucket private بعد فحص MIME الفعلي، الحجم، الامتداد، hash، وmalware/quarantine policy. لا public share links. تنزيل الملف يمر عبر server proxy يحقق العضوية وvisibility ثم يبث الملف؛ signed URL إن استُخدم يكون قصيرًا جدًا ولا يقدم كآلية سحب فورية. الحذف يضع tombstone ويوقف أي AI run غير مقبول.
+
+AI v1 اختياري. المسار هو document → extracted text + source references → `review_required` → قبول بشري. الناتج draft لا يكتب note أو task أو medication instruction تلقائيًا. ممنوع تشخيص أو تفسير تحاليل أو نصيحة علاجية أو نشر regimen. يجب أن يعمل المنتج كاملًا بدون AI adapter، مع `model_name`, `prompt_version`, ومراجع المصدر للتدقيق.
+
+لا نخزن health cache دائمًا محليًا. في الانقطاع يعرض العميل action pending بلا ادعاء الحفظ؛ وعند reconnect يلزم auth وversion check، وقد يرجع `409` للمراجعة.
+
+تصدير care summary يتطلب selection محدودًا، visibility و`can_export` الحاليين، تأكيدًا بشريًا وexpiry قصيرًا؛ لا URL عام. يسجل selection وconsent snapshot وrequester وaudit. tombstone يمنع الوصول الطبيعي، لكن backup يحتفظ حتى دورة انتهاء معلنة.
+
+## 7. واجهة HTTP `/api/v1`
+
+كل طلب يتطلب `Authorization: Bearer <Supabase JWT>`. `X-Request-Id` اختياري؛ إذا غاب يولد الخادم request ID ويرجعه في كل استجابة. كل POST/PUT/PATCH/DELETE يقبل `Idempotency-Key` canonical header بطول 1–128؛ لا يوجد مفتاح idempotency مكرر في body. القوائم تستخدم `limit` بحد أقصى 100 و`cursor` opaque مبنيًا على `(created_at,id)`، وتعيد `next_cursor`. `Accept-Timezone` لا يغيّر الحقيقة المخزنة؛ المنطقة تُستعمل فقط للعرض، بينما request dates ISO-8601 UTC مثل `2026-11-01T10:00:00Z`.
+
+كل route يعيد server-filtered capabilities مع المورد، مثل `can_view_health_data`, `can_export`, `can_edit`, `can_accept_assignment`, و`can_withdraw`; لا يستنتج العميل الصلاحية من role وحده. أي health response أو metadata يمر عبر current processing basis و`health_processing_enabled` وauthorization epoch في لحظة الطلب.
+
+### الحساب والدائرة والمستفيد والأعضاء
+
+`GET /api/v1/me` يعيد الملف والمنطقة والـlocale والصلاحيات العامة.  
+`GET /api/v1/circles` يعيد الدوائر التي فيها membership active دون كشف دائرة أخرى.  
+`GET /api/v1/circles/{circleId}` و`PATCH /api/v1/circles/{circleId}` يقرآن metadata العامة ويغيران الاسم/المنطقة المستقبلية فقط؛ لا يعيدان تفسير snapshots.  
+`POST /api/v1/circles` ينشئ circle وrecipient منفصلين، ويتطلب `consent_version` و`authority_attestation_text`.  
+`GET /api/v1/circles/{circleId}/recipient` و`PATCH /api/v1/circles/{circleId}/recipient` يقرآن ويعدلان الملف بحسب سياسة الدور، ولا يسمحان بتحويله إلى user دون تحقق منفصل.  
+`GET /api/v1/circles/{circleId}/members` يخفي بيانات الصحة، ويعرض `can_view_health_data` و`can_export` كأعلام إدارية لا كحق قراءة. `PATCH /api/v1/circles/{circleId}/members/{memberId}` يغير الدور أو الأعلام عبر server authorization، و`GET` و`DELETE` على item العضو يعيدان/يزيلان العضوية؛ إزالة العضو ليست recipient withdrawal.
+
+`GET /api/v1/circles/{circleId}/invitations` و`POST /api/v1/circles/{circleId}/invitations` يديران collection الدعوات، و`GET /api/v1/circles/{circleId}/invitations/{id}` يعيد metadata المسموحة، و`DELETE /api/v1/circles/{circleId}/invitations/{id}` يلغي item. `GET /api/v1/invitations/{token}/preview` يعرض preview محدودًا، و`POST /api/v1/invitations/{token}/accept` أو `POST /api/v1/invitations/{token}/reject` ينهيان الدعوة. قبول الدعوة يتطلب بريدًا مصادقًا normalized مساويًا للبريد المدعو وtoken غير منتهٍ وغير مستخدم؛ `404` لدعوة غير موجودة أو منتهية يمنع enumeration.
+
+### المهام والقوالب والوقائع والتعيين
+
+`GET /api/v1/circles/{circleId}/tasks` يعيد templates مرئية فقط، و`POST /api/v1/circles/{circleId}/tasks` ينشئ template وversion بعد التحقق من RRULE MVP. `GET /api/v1/circles/{circleId}/tasks/{taskId}` يعيد item، و`PATCH .../tasks/{taskId}` ينشئ version جديدة ولا يغيّر الماضي، و`DELETE .../tasks/{taskId}` يلغي القالب والـfuture occurrences المسموح بها عبر حدث واضح ولا يحذف snapshots التاريخية.  
+`GET /api/v1/circles/{circleId}/occurrences?from=&to=&cursor=` يعيد snapshots، و`GET /api/v1/circles/{circleId}/occurrences/{occurrenceId}` يعيد occurrence detail بعد health filtering، و`GET /api/v1/circles/{circleId}/occurrences/{occurrenceId}/records` يعيد record list المرئية فقط. `POST /api/v1/circles/{circleId}/occurrences/{occurrenceId}/records` يسجل done/not_done، و`GET /api/v1/circles/{circleId}/records/{recordId}` يعيد item، و`POST /api/v1/circles/{circleId}/records/{recordId}/corrections` ينشئ correction immutable.
+
+`GET /api/v1/circles/{circleId}/occurrences/{occurrenceId}/assignments` و`POST .../assignments` يعرضان/ينشئان assignment proposal pending. `GET /api/v1/circles/{circleId}/assignments/{assignmentId}` يعيد item، و`POST .../assignments/{assignmentId}/accept` أو `/decline` يتطلبان member active و`expected_row_version`. `POST /api/v1/circles/{circleId}/assignments/{assignmentId}/handoff` ينشئ target proposal؛ يظل accepted الحالي حتى قبول الهدف ثم تستبدله transaction واحدة. لا تعني الدعوة أو pending أن المستخدم assignee.
+
+مثال request لتسجيل متابعة؛ مفتاح idempotency في header فقط:
+
+```http
+POST /api/v1/circles/{circleId}/occurrences/{occurrenceId}/records
+Authorization: Bearer <JWT>
+Idempotency-Key: rec-01J...
+```
+
+```json
+{
+  "result": "done",
+  "truth_source": "reported",
+  "observed_at": null,
+  "observed_time_unknown": true,
+  "reported_by_label": "قال إنه أنهى المتابعة",
+  "note": "أُبلغت بها",
+  "expected_row_version": 3
+}
+```
+
+الاستجابة تعيد minimal metadata و`request_id` وcapabilities. إذا كان `expected_row_version` قديمًا يرجع `409 stale_version` بلا overwrite. إذا كان occurrence health وعضو بلا الأساس الحالي والعلم، يرجع `404` كـnot found عمليًا، ولا يثبت وجوده عبر `403`.
+
+### المواعيد والتعليمات والملاحظات والملفات
+
+`GET /api/v1/circles/{circleId}/appointments` و`POST .../appointments` يديران collection، و`GET/PATCH/DELETE /api/v1/circles/{circleId}/appointments/{appointmentId}` يدير item إداريًا مع same-circle recipient وvisibility. `POST /api/v1/circles/{circleId}/appointments/{appointmentId}/link-tasks` يربط occurrence مستقلة مع حفظ snapshot.  
+`GET/POST /api/v1/circles/{circleId}/medication-instructions` يديران collection بشرية مرجعية، و`GET/PATCH/DELETE /api/v1/circles/{circleId}/medication-instructions/{instructionId}` يدير item؛ لا يقبل route dose regimen مولدًا من AI.  
+`GET/POST /api/v1/circles/{circleId}/notes` و`GET/PATCH/DELETE /api/v1/circles/{circleId}/notes/{noteId}` تطبق health visibility وparent-child visibility قبل البحث والعداد.
+
+`POST /api/v1/circles/{circleId}/documents/initiate` يصدر upload intent بعد consent وMIME/size validation، و`POST /api/v1/circles/{circleId}/documents/{documentId}/complete` يثبت hash والحجم الفعلي. `GET /api/v1/circles/{circleId}/documents` يعيد collection metadata المسموحة، و`GET/PATCH/DELETE /api/v1/circles/{circleId}/documents/{documentId}` يدير item؛ download منفصل عبر `GET .../documents/{documentId}/download` وproxy خادمي. `GET/POST /api/v1/circles/{circleId}/documents/{documentId}/ai-runs` يدير collection runs، و`GET /api/v1/circles/{circleId}/documents/{documentId}/ai-runs/{runId}` يعيد item، و`POST .../{runId}/review` يقبل أو يرفض بعد مراجعة إنسان. لا provider/tool auto-publish.
+
+### الإشعارات والخط الزمني والخصوصية والتصدير والتدقيق
+
+`GET /api/v1/circles/{circleId}/notifications` يعيد inbox المرئي للمستخدم، و`GET /api/v1/circles/{circleId}/notifications/{notificationId}` يعيد item، و`POST .../{notificationId}/read` و`POST .../{notificationId}/action` يسجلان القراءة/الإجراء. `GET/PATCH /api/v1/circles/{circleId}/notification-preferences` يديران preferences؛ follow-up false أوليًا. `POST /api/v1/circles/{circleId}/followup-routes` ينشئ proposal صريحًا، و`GET/PATCH/DELETE /api/v1/circles/{circleId}/followup-routes/{routeId}` يعرض/يقبل/يلغي route؛ لا route افتراضيًا. `POST /api/v1/push-subscriptions` و`DELETE /api/v1/push-subscriptions/{id}` يحفظان endpoint السري أو يسحبانه.
+
+`GET /api/v1/circles/{circleId}/timeline` هو timeline تشغيلي منفصل عن admin audit، ويطبق health filtering. `GET /api/v1/circles/{circleId}/audit-events` للـadmin فقط، وبmetadata قليلة بلا نصوص حساسة. ويمكن، إن فُعّل المنتج، `GET /api/v1/inbox` كـglobal user inbox لا يتجاوز صلاحيات كل دائرة.
+
+`POST /api/v1/circles/{circleId}/exports` ينشئ export بعد selection وconfirmation و`can_export`، و`GET /api/v1/circles/{circleId}/exports/{exportId}` يعيد حالة metadata فقط، و`DELETE .../exports/{exportId}` يلغي item، و`GET .../exports/{exportId}/download` يمر عبر proxy ويوقف بعد expiry. `POST /api/v1/circles/{circleId}/privacy/withdraw-processing` و`POST /api/v1/circles/{circleId}/privacy/revoke-authorization` يسجلان recipient withdrawal ويوقفان لكل المستفيد health read/write/AI/exports/jobs/notifications ويزيدان epoch. admin لا يستطيع self-grant ضد authorization المستفيد. `DELETE /api/v1/me` يبدأ حذف الحساب وفصل linked recipient وفق سياسة الدائرة، ولا يمحو audit integrity بلا أثر.
+
+الـrole يحدد operations فقط: `viewer` read-only لنطاقه وown inbox/preferences؛ `caregiver` coordination وrecord operations ضمن scope؛ `admin` membership coordination والإعدادات. لكن health processing basis/consent الحالي و`health_processing_enabled` مطلوبان لكل الأدوار، و`can_export` grant مستقل يتقاطع دائمًا مع health flag والauthorization الحالي.
+
+## 8. أخطاء العقد والتحقق
+
+`401` تعني JWT مفقودًا أو غير صالح. `404` يعني أن المورد غير موجود أو غير مرئي بسبب health scope، لتقليل enumeration. `409` للنزاع، مثل stale row version أو قبول assignment سبق أن قبله مستخدم آخر أو idempotency key مع body مختلف. `422` لحقول غير صالحة، RRULE غير مدعومة، timezone غير IANA، MIME غير مسموح، أو محاولة نشر AI draft كتعليمات. `429` لتجاوز rate limit لكل user/IP، خصوصًا الدعوات والرفع والبحث والتصدير.
+
+صيغة خطأ ثابتة:
+
+```json
+{
+  "error": {
+    "code": "stale_version",
+    "message_ar": "البيانات اتغيرت؛ حدّث الصفحة وحاول تاني.",
+    "details": {"expected": 3, "actual": 4}
+  },
+  "request_id": "req_..."
+}
+```
+
+لا يرسل الخادم stack trace أو `storage_key` أو token أو نصًا صحيًا في الخطأ. قبل إرجاع نتيجة idempotency cached يعاد authorization والـcurrent processing basis والـauthorization epoch؛ إذا سُحبت الموافقة أو تغيّر scope فلا يعاد أي health JSON قديم، بل `404`/`410` مناسب مع minimal metadata. تتكرر الطلبات بأمان فقط إذا تطابق `Idempotency-Key` وrequest hash؛ يحتفظ السجل بـ`response_ref`/metadata دنيا بدل raw health response حيث يمكن. TTL للسجل مثل 24 ساعة للعمليات العادية، وأطول للتصدير حسب الحاجة.
+
+## 9. التفويض وRLS والاختبارات التشغيلية
+
+دوال authorization المركزية هي `is_active_member(circle_id, auth.uid())` و`can_view(circle_id, auth.uid(), visibility)`، ولا تكرر كل route منطقًا متناقضًا. `can_view` يتحقق من active membership، وcurrent consent/processing basis relationship للمستفيد، و`care_circles.health_processing_enabled` و`authorization_epoch`، ثم يسمح بـgeneral؛ ولا يسمح بـhealth إلا مع كل ذلك و`can_view_health_data=true`. Admin لا يتجاوز recipient authorization ولا يستطيع self-grant. queries للعدادات والبحث والتصدير والتimeline تستعمل نفس predicate قبل `count(*)` أو full-text search.
+
+القراءة قد تستخدم RLS، لكن mutation للـoccurrence/record/assignment/consent/document/export تمر بخادم يضع `search_path` مضبوطًا، ويتحقق من circle ownership والـrow_version وepoch ويكتب audit. إذا استُخدمت RPC، تكون typed parameters و`SECURITY DEFINER` ضيقة، لا exposed generic CRUD. grants للـauthenticated هي أقل قدر، وdirect Data API write إلى operational tables مسحوب أو غير ممنوح. كل state write للـworker فقط عبر المسار الخادمي الموثق. توثيق Supabase يوصي باختبار كل سياسة allow/deny عبر pgTAP وعدم اعتبار وجود policy وحده كافيًا [1] [2].
+
+اختبارات: viewer بلا health لا يرى task أو count أو notification أو document؛ Admin بلا الأساس الحالي يفشل. recipient withdrawal يوقف health/AI/export/outbox ولو بقيت العضوية، وإزالة العضو تختبر مسارًا منفصلًا. سباق assignment يفوز فيه واحد، وhandoff يبقي accepted حتى قبول الهدف. correction لا يعدّل القديم ولا يسمح forkًا؛ projection وepoch يمنعان stale/late writes. timezone وDST لا يغيران snapshot بصمت. idempotency بعد revoke لا يعيد health JSON، وproxy لا يعيد الملف، مع الاعتراف بأن نسخة الجهاز لا تُسحب.
+
+## 10. تشغيل وتسليم تدريجي
+
+المرحلة الأولى تبني Auth، circles، members، visibility، tasks/occurrences، records، in-app inbox، وaudit. المرحلة الثانية تضيف appointments، documents، exports، وbest-effort Web Push. المرحلة الثالثة تضيف AI drafts خلف feature flag، مع consent وreview إلزاميين. لا يُربط أي إطلاق بادعاء legal compliance أو clinical safety. يسجل التطبيق human data authority attestation كنص ونسخة وتاريخ، لكنه ليس تحققًا قانونيًا. تبقى الوقائع التاريخية وfuture schedule snapshots immutable مع سجل cancellation/replacement؛ لا يوجد clinical completion inference.
+
+كل دقيقة يلتقط Cron rows pending ذات `available_at <= now()`، ويشغل dispatcher محدودًا في الزمن والعدد، ثم retry مع backoff وdead-letter منطقي عبر `failed`. مراقبة التشغيل تعرض latency وعدد retries وstale jobs، وليس محتوى صحيًا. يجب تدوير مفاتيح VAPID وSupabase server secrets، وفصل بيئة الاختبار عن الإنتاج، وتسجيل request IDs بدل PII.
+
+## References
+
+[1]: https://supabase.com/docs/guides/database/postgres/row-level-security "Supabase Row Level Security"
+[2]: https://supabase.com/docs/guides/api/securing-your-api "Supabase Securing your API"
+[3]: https://supabase.com/docs/guides/database/extensions/pg_cron "Supabase pg_cron"
+[4]: https://developer.mozilla.org/en-US/docs/Web/API/Push_API "MDN Push API"
+[5]: https://developer.mozilla.org/en-US/docs/Web/API/Notifications_API/Using_the_Notifications_API "MDN Using the Notifications API"
